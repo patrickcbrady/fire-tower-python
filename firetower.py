@@ -1,8 +1,9 @@
+from __future__ import annotations
 import random
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Union, Callable, Set, Any, Optional, Dict, NamedTuple
+from typing import List, Union, Callable, Set, Any, Optional, Dict, NamedTuple, Tuple
 
 import PySimpleGUI as sg
 from frozendict import frozendict
@@ -31,11 +32,27 @@ class Point(NamedTuple):
     x: int
     y: int
 
-    def __add__(self, o):
+    def __add__(self, o) -> Point:
         return Point(self.x + o.x, self.y + o.y)
 
-    def __sub__(self, o):
+    def __sub__(self, o) -> Point:
         return Point(self.x - o.x, self.y - o.y)
+
+    @property
+    def left(self) -> Point:
+        return self + Point(-1, 0)
+
+    @property
+    def right(self) -> Point:
+        return self + Point(1, 0)
+
+    @property
+    def up(self) -> Point:
+        return self + Point(0, -1)
+
+    @property
+    def down(self) -> Point:
+        return self + Point(0, 1)
 
 
 class WindDir(Enum):
@@ -150,6 +167,18 @@ class TileStatus(Enum):
     off_board = 'off board'
 
 
+class OrientationEnum(Enum):
+    h = 'horizontal'
+    v = 'vertical'
+
+    @property
+    def flip(self) -> OrientationEnum:
+        if self is OrientationEnum.h:
+            return OrientationEnum.v
+        if self is OrientationEnum.v:
+            return OrientationEnum.h
+
+
 class FireTowerGame:
     BOARD_SIZE = 16
 
@@ -170,9 +199,11 @@ class FireTowerGame:
         for pos in self.eternal_flame:
             self.board[pos] = TileStatus.fire
 
-        self.players = Players.three_player()
+        self.players = Players.four_player()
 
         self.wind = None
+        self.action = self.add_wind_fire
+        self.orientation = OrientationEnum.h
         self.roll_wind()
 
         self.window = sg.Window('FireTower', layout=self._init_layout())
@@ -187,12 +218,34 @@ class FireTowerGame:
             self.update(event=event, values=values)
             self.draw()
 
+    def set_oriented_action(self, action: Callable):
+        if self.action == action:
+            self.orientation = self.orientation.flip
+        self.action = action
+
     def update(self, event: Optional[Any] = None, values: Optional[Union[Dict, List]] = None):
         if isinstance(event, Point):
-            self.add_wind_fire(event)
+            self.action(event)
         elif event == '-W-':
             self.roll_wind()
             self.window['wind'].update(f'Wind Direction: {self.wind.value}')
+        elif event == '-Fire-':
+            self.action = self.add_wind_fire
+        elif event == '-DL-':
+            self.set_oriented_action(self.dozer_line)
+        elif event == '-SL-':
+            self.set_oriented_action(self.scratch_line)
+        elif event == '-DRF-':
+            self.action = self.de_re_forest
+        elif event == '-FL-':
+            self.set_oriented_action(self.flare_up)
+        elif event == '-EXPL-':
+            self.action = self.explosion
+        elif event == '-EMBR-':
+            self.action = self.ember_phase_one
+        elif event == '-BSNG-':
+            self.action = self.burning_snag
+
         self.check_for_victory()
 
     def check_for_victory(self):
@@ -205,6 +258,14 @@ class FireTowerGame:
         new_remaining = [p for p in self.players if p.active]
         if len(new_remaining) == 1:
             self.victory(new_remaining[0])
+
+    @property
+    def towers(self) -> Set[Point]:
+        return set.union(*[player.corner.tower for player in self.players])
+
+    @property
+    def corners(self) -> Set[Point]:
+        return set.union(*[player.corner.point for player in self.players])
 
     def victory(self, player: Player):
         self.active = False
@@ -220,6 +281,9 @@ class FireTowerGame:
         return self.wind
 
     def _init_layout(self) -> List[List[Any]]:
+        def action_btn(name: str):
+            return sg.Button(name, size=(4, 1), button_color=('black', 'gray'), key=f'-{name}-')
+
         colors = self.board.get_colors(self.players)
         layout = [[sg.Button('', size=(2, 1), button_color=('white', colors[Point(r, c)]), key=Point(r, c))
                    for r in range(0, self.BOARD_SIZE)] for c in range(0, self.BOARD_SIZE)]
@@ -227,16 +291,108 @@ class FireTowerGame:
                                                                                             button_color=(
                                                                                                 'black', 'gray'),
                                                                                             key='-W-')])
+        layout.append([action_btn('Fire'),
+                       action_btn('DL'),
+                       action_btn('SL'),
+                       action_btn('DRF'),
+                       action_btn('FL'),
+                       action_btn('EXPL'),
+                       action_btn('EMBR'),
+                       action_btn('BSNG')])
         return layout
-
-    def set_fire(self, point: Point):
-        if self.board[point] is TileStatus.tree and self.board.has_orthogonal_fire(point):
-            self.board[point] = TileStatus.fire
 
     def add_wind_fire(self, point: Point):
         wind_point = point - self.wind.as_vector()
         if self.board[point] is TileStatus.tree and self.board[wind_point] is TileStatus.fire:
             self.board[point] = TileStatus.fire
+
+    def has_orthogonal(self, point: Point, status: TileStatus):
+        return (self.board[point.left] is status or self.board[point.right] is status
+                or self.board[point.up] is status or self.board[point.down] is status)
+
+    def validate_firebreak(self, point: Point):
+        return (self.board[point] is TileStatus.tree and point not in self.towers
+                and not self.has_orthogonal(point, TileStatus.firebreak))
+
+    def add_firebreak_cluster(self, cluster: Tuple[Point, Point]):
+        valid = all([self.validate_firebreak(p) for p in cluster])
+        if valid:
+            for p in cluster:
+                self.board[p] = TileStatus.firebreak
+        else:
+            print(f'{cluster} not valid for placing a firebreak')
+
+    def dozer_line(self, point: Point):
+        """Place two firebreak tokens adjacent to each other. Neither may be adjacent to any other firebreak"""
+        cluster = (point, point.right) if self.orientation is OrientationEnum.h else (point, point.down)
+        self.add_firebreak_cluster(cluster)
+
+    def de_re_forest(self, point: Point):
+        """Add or remove one firebreak token"""
+        if self.validate_firebreak(point):
+            self.board[point] = TileStatus.firebreak
+        elif self.board[point] is TileStatus.firebreak:
+            self.board[point] = TileStatus.tree
+        else:
+            print(f'Cannot add or remove firebreak at {point}')
+
+    def scratch_line(self, point: Point):
+        """Place two firebreak tokens one space apart, either horizontally or vertically"""
+        cluster = (point, point.right.right) if self.orientation is OrientationEnum.h else (point, point.down.down)
+        self.add_firebreak_cluster(cluster)
+
+    def flare_up(self, point: Point):
+        """
+        Place three fire gems in a horizontal or vertical line.
+        At least one gem must be orthogonal to an existing gem
+        """
+        flare_line = ([point, point.right, point.right.right] if self.orientation is OrientationEnum.h
+                      else [point, point.down, point.down.down])
+        filtered_flare = []
+        for p in flare_line:
+            if self.board[p] is TileStatus.firebreak:
+                break
+            if self.board[p] is TileStatus.tree:
+                filtered_flare.append(p)
+        if any(self.has_orthogonal(p, TileStatus.fire) for p in filtered_flare):
+            for p in filtered_flare:
+                self.board[p] = TileStatus.fire
+
+    def burning_snag(self, point: Point):
+        """Place four fire gems in a square pattern. The selected point is the upper-left corner of the square"""
+        square = (point, point.right, point.down, point.right.down)
+        if (any(self.has_orthogonal(p, TileStatus.fire) for p in square) and
+                any(self.board[p] is TileStatus.tree for p in square)):
+            for p in square:
+                if self.board[p] is TileStatus.tree:
+                    self.board[p] = TileStatus.fire
+
+    def explosion(self, point: Point):
+        """Convert an existing fire gem to a firebreak. All 8 surrounding tiles become fire if possible"""
+        if self.board[point] is not TileStatus.fire or point in self.eternal_flame:
+            return
+        area = (point.up.left, point.up, point.up.right, point.right, point.left, point.down.left, point.down,
+                point.down.right)
+        if any(self.board[p] is TileStatus.tree for p in area):
+            self.board[point] = TileStatus.firebreak
+            for p in area:
+                if self.board[p] is TileStatus.tree:
+                    self.board[p] = TileStatus.fire
+
+    def ember_phase_one(self, point: Point):
+        """Select any fire gem on the board and remove it, then proceed to phase two"""
+        if self.board[point] is TileStatus.fire and point not in self.eternal_flame and point not in self.towers:
+            self.board[point] = TileStatus.tree
+            self.action = self.ember_phase_two
+
+    def ember_phase_two(self, point: Point):
+        """Place the removed fire gem from phase one on any space that's orthogonal to an existing fire gem"""
+        if self.board[point] is TileStatus.tree and self.has_orthogonal(point, TileStatus.fire):
+            self.board[point] = TileStatus.fire
+            self.action = self.no_action
+
+    def no_action(self, *_, **__):
+        pass
 
     def draw(self):
         self.board.draw(self.window, self.players)
@@ -260,16 +416,6 @@ class Board:
     @staticmethod
     def on_board(point: Point) -> bool:
         return point.x in range(0, FireTowerGame.BOARD_SIZE) and point.y in range(0, FireTowerGame.BOARD_SIZE)
-
-    def has_orthogonal_fire(self, point: Point) -> bool:
-        orthogonal_points = [
-            point + Point(1, 0),
-            point - Point(1, 0),
-            point + Point(0, 1),
-            point - Point(0, 1)
-        ]
-        fires = [True for o_point in orthogonal_points if self[o_point] is TileStatus.fire]
-        return bool(fires)
 
     def get_colors(self, players: Players) -> Dict[Point, str]:
         res = {point: self.COLOR_MAP[self[point]] for point in [Point(r, c)
