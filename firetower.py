@@ -3,7 +3,7 @@ import random
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Union, Callable, Set, Any, Optional, Dict, NamedTuple, Tuple
+from typing import List, Union, Callable, Set, Any, Optional, Dict, NamedTuple, Tuple, Iterable
 
 import PySimpleGUI as sg
 from frozendict import frozendict
@@ -228,7 +228,6 @@ class FireTowerGame:
             self.action(event)
         elif event == '-W-':
             self.roll_wind()
-            self.window['wind'].update(f'Wind Direction: {self.wind.value}')
         elif event == '-Fire-':
             self.action = self.add_wind_fire
         elif event == '-DL-':
@@ -245,7 +244,16 @@ class FireTowerGame:
             self.action = self.ember_phase_one
         elif event == '-BSNG-':
             self.action = self.burning_snag
-
+        elif event == '-FT-':
+            self.action = self.fire_truck
+        elif event == '-AD-':
+            self.set_oriented_action(self.air_drop)
+        elif event == '-SJ-':
+            self.action = self.smoke_jumper
+        elif event == '-FS-':
+            self.action = self.no_action
+            self.fire_storm()
+        self.window['wind'].update(f'Wind Direction: {self.wind.value}')
         self.check_for_victory()
 
     def check_for_victory(self):
@@ -258,6 +266,8 @@ class FireTowerGame:
         new_remaining = [p for p in self.players if p.active]
         if len(new_remaining) == 1:
             self.victory(new_remaining[0])
+        if not new_remaining:
+            self.defeat()
 
     @property
     def towers(self) -> Set[Point]:
@@ -267,6 +277,10 @@ class FireTowerGame:
     def corners(self) -> Set[Point]:
         return set.union(*[player.corner.point for player in self.players])
 
+    def defeat(self):
+        self.active = False
+        print('Game over! All players burned!')
+
     def victory(self, player: Player):
         self.active = False
         print(f'{player.name} wins!')
@@ -274,11 +288,13 @@ class FireTowerGame:
 
     def roll_wind(self) -> WindDir:
         old_wind = self.wind
-        valid_winds = {w for c in [p.corner for p in self.players if p.active] for w in c}
-        print(f'Valid Winds: {valid_winds}')
         while self.wind is old_wind:
-            self.wind = random.choice(list(valid_winds))
+            self.wind = self.get_random_wind()
         return self.wind
+
+    def get_random_wind(self) -> WindDir:
+        valid_winds = {w for c in [p.corner for p in self.players if p.active] for w in c}
+        return random.choice(list(valid_winds))
 
     def _init_layout(self) -> List[List[Any]]:
         def action_btn(name: str):
@@ -298,7 +314,11 @@ class FireTowerGame:
                        action_btn('FL'),
                        action_btn('EXPL'),
                        action_btn('EMBR'),
-                       action_btn('BSNG')])
+                       action_btn('BSNG'),
+                       action_btn('FT'),
+                       action_btn('AD'),
+                       action_btn('SJ'),
+                       action_btn('FS')])
         return layout
 
     def add_wind_fire(self, point: Point):
@@ -390,6 +410,52 @@ class FireTowerGame:
         if self.board[point] is TileStatus.tree and self.has_orthogonal(point, TileStatus.fire):
             self.board[point] = TileStatus.fire
             self.action = self.no_action
+
+    def can_put_out(self, points: Iterable[Point]):
+        return not (any([p in self.eternal_flame for p in points])
+                    or not any([self.board[p] is TileStatus.fire for p in points]))
+
+    def put_out_fire(self, points: Iterable[Point]):
+        for p in points:
+            if p not in set.union(self.towers, self.eternal_flame) and self.board[p] is TileStatus.fire:
+                self.board[p] = TileStatus.tree
+
+    def is_valid_smoke_jump(self, point: Point):
+        return point not in self.eternal_flame and self.board[point] is TileStatus.fire and point not in self.towers
+
+    def air_drop(self, point: Point):
+        """Put out three fire gems in a horizontal or vertical line"""
+        water_line = ((point, point.right, point.right.right) if self.orientation is OrientationEnum.h
+                      else (point, point.down, point.down.down))
+        if self.can_put_out(water_line):
+            self.put_out_fire(water_line)
+
+    def fire_truck(self, point: Point):
+        """Put out fire in four spaces in a square"""
+        square = (point, point.right, point.down, point.right.down)
+        if self.can_put_out(square):
+            self.put_out_fire(square)
+
+    def smoke_jumper(self, point: Point):
+        """Put out all 8 tiles that surround an existing fire gem. The center gem remains"""
+        if self.is_valid_smoke_jump(point):
+            area = (point.up.left, point.up, point.up.right, point.left, point.right, point.down.left, point.down,
+                    point.down.right)
+            self.put_out_fire(area)
+
+    def fire_storm(self):
+        """
+        Add 1 fire gem orthogonal to every existing fire gem on the board, in a randomly selected wind direction.
+        Then, re-roll the wind direction for the game; the re-roll may be the same direction as before the firestorm
+        """
+        storm_wind = self.get_random_wind()
+        full_board = range(0, self.BOARD_SIZE)
+        fire_points = {p for p in self.get_board_range(full_board, full_board) if self.board[p] is TileStatus.fire}
+        for fp in fire_points:
+            storm_pt = fp + storm_wind.as_vector()
+            if self.board[storm_pt] is TileStatus.tree:
+                self.board[storm_pt] = TileStatus.fire
+        self.wind = self.get_random_wind()
 
     def no_action(self, *_, **__):
         pass
